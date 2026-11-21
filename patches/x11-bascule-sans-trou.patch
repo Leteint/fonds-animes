@@ -1,0 +1,45 @@
+diff --git a/src/WallpaperEngine/Render/Drivers/Output/X11Output.cpp b/src/WallpaperEngine/Render/Drivers/Output/X11Output.cpp
+index 193ab8d..5320ebd 100644
+--- a/src/WallpaperEngine/Render/Drivers/Output/X11Output.cpp
++++ b/src/WallpaperEngine/Render/Drivers/Output/X11Output.cpp
+@@ -210,8 +210,8 @@ void X11Output::initX11Background () {
+     this->m_gc = XCreateGC (this->m_display, this->m_pixmap, 0, nullptr);
+     // pre-fill it with black
+     XFillRectangle (this->m_display, this->m_pixmap, this->m_gc, 0, 0, this->m_fullWidth, this->m_fullHeight);
+-    // set the window background as our pixmap
+-    XSetWindowBackgroundPixmap (this->m_display, this->m_root, this->m_pixmap);
++    // patch local : le fond du bureau n'est attribué qu'au premier rendu réel (voir updateRender)
++    this->m_framesRendered = 0;
+     // allocate space for the image's data
+     this->m_imageSize = this->m_fullWidth * this->m_fullHeight * 4;
+     this->m_imageData = new char[this->m_fullWidth * this->m_fullHeight * 4];
+@@ -229,6 +229,15 @@ void X11Output::updateRender () const {
+ 	this->m_display, this->m_pixmap, this->m_gc, this->m_image, 0, 0, 0, 0, this->m_fullWidth, this->m_fullHeight
+     );
+ 
++    // patch local : on laisse l'ancien fond affiché tant que les premières images ne sont pas prêtes
++    if (this->m_framesRendered < 5) {
++	if (++this->m_framesRendered < 5) {
++	    XFlush (this->m_display);
++	    return;
++	}
++	XSetWindowBackgroundPixmap (this->m_display, this->m_root, this->m_pixmap);
++    }
++
+     // _XROOTPMAP_ID & ESETROOT_PMAP_ID allow other programs (compositors) to
+     // edit the background. Without these, other programs will clear the screen.
+     // it also forces the compositor to refresh the background (tested with picom)
+diff --git a/src/WallpaperEngine/Render/Drivers/Output/X11Output.h b/src/WallpaperEngine/Render/Drivers/Output/X11Output.h
+index e164b51..bf173e6 100644
+--- a/src/WallpaperEngine/Render/Drivers/Output/X11Output.h
++++ b/src/WallpaperEngine/Render/Drivers/Output/X11Output.h
+@@ -39,6 +39,8 @@ private:
+     char* m_imageData = nullptr;
+     uint32_t m_imageSize = 0;
+     XImage* m_image = nullptr;
++    // patch local : ne prendre le fond du bureau qu'après N images rendues (bascule sans trou)
++    mutable int m_framesRendered = 0;
+     std::vector<OutputViewport*> m_screens = {};
+ };
+ } // namespace WallpaperEngine::Render::Drivers::Output
+\ No newline at end of file

@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Sélecteur graphique de fonds animés (Wallpaper Engine Workshop -> linux-wallpaperengine)."""
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, GdkPixbuf, GLib, Pango
+
+HOME = Path.home()
+# le lanceur est cherché à côté de ce script, sinon dans le PATH
+_here = Path(__file__).resolve().parent / "fond-anime"
+LAUNCHER = str(_here) if _here.is_file() else (shutil.which("fond-anime") or "fond-anime")
+_loader = importlib.machinery.SourceFileLoader("fond_anime", LAUNCHER)
+_spec = importlib.util.spec_from_loader("fond_anime", _loader)
+fa = importlib.util.module_from_spec(_spec)
+_loader.exec_module(fa)
+
+THUMB_W, THUMB_H = 240, 135
+FPS_CHOICES = [10, 15, 24, 30, 60]
+ALL = "__all__"
+
+
+def list_wallpapers():
+    items = []
+    dirs = sorted((d for w in fa.workshop_dirs() for d in w.glob("*/")), key=lambda d: d.name)
+    for d in dirs:
+        try:
+            p = json.loads((d / "project.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        preview = d / p.get("preview", "")
+        items.append({
+            "id": d.name,
+            "title": p.get("title", d.name),
+            "type": str(p.get("type", "?")).lower(),
+            "preview": preview if preview.is_file() else None,
+        })
+    return items
+
+
+def thumbnail(path):
+    if path is None:
+        return Gtk.Image.new_from_icon_name("image-missing", Gtk.IconSize.DIALOG)
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), THUMB_W, THUMB_H, True)
+        return Gtk.Image.new_from_pixbuf(pb)
+    except GLib.Error:
+        pass
+    try:
+        # GIF légèrement corrompus (« Not all frames… ») : le chargeur d'animation les accepte
+        pb = GdkPixbuf.PixbufAnimation.new_from_file(str(path)).get_static_image()
+        scale = min(THUMB_W / pb.get_width(), THUMB_H / pb.get_height())
+        pb = pb.scale_simple(max(1, int(pb.get_width() * scale)), max(1, int(pb.get_height() * scale)),
+                             GdkPixbuf.InterpType.BILINEAR)
+        return Gtk.Image.new_from_pixbuf(pb)
+    except (GLib.Error, AttributeError):
+        return Gtk.Image.new_from_icon_name("image-missing", Gtk.IconSize.DIALOG)
+
+
+def screen_label(name, index, count):
+    pos = ""
+    if count == 2:
+        pos = "gauche" if index == 0 else "droite"
+    elif count > 2:
+        pos = f"n°{index + 1}"
+    kind = "portable" if name.startswith(("eDP", "LVDS")) else "externe"
+    return f"Écran {pos} – {kind} ({name})".replace("Écran  –", "Écran –")
+
+
+class Selecteur(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Fonds animés")
+        self.set_default_size(880, 680)
+        self.set_icon_name("preferences-desktop-wallpaper")
+        self.cfg = fa.load()
+        self.titles = {}
+        self.buttons = {}
+        self._pending = None
+
+        header = Gtk.HeaderBar(title="Fonds animés", show_close_button=True)
+        self.set_titlebar(header)
+        self.stop_btn = Gtk.Button(label="Arrêter")
+        self.stop_btn.set_tooltip_text("Revenir au fond d'écran habituel (sur tous les écrans)")
+        self.stop_btn.connect("clicked", self.on_stop)
+        header.pack_end(self.stop_btn)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Recharger (nouveaux fonds du Workshop, écrans branchés/débranchés)")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_end(refresh)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(vbox)
+
+        # Barre de réglages : écran, images/s, son
+        bar = Gtk.Box(spacing=10, margin=8)
+        vbox.pack_start(bar, False, False, 0)
+
+        bar.pack_start(Gtk.Label(label="Écran :"), False, False, 0)
+        self.screen_combo = Gtk.ComboBoxText()
+        self.screen_combo.connect("changed", lambda *_: self.refresh_state())
+        bar.pack_start(self.screen_combo, False, False, 0)
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+        bar.pack_start(Gtk.Label(label="Images/s :"), False, False, 0)
+        self.fps = Gtk.ComboBoxText()
+        cur_fps = str(self.cfg["fps"])
+        for f in FPS_CHOICES:
+            self.fps.append(str(f), str(f))
+        if cur_fps not in [str(f) for f in FPS_CHOICES]:
+            self.fps.append(cur_fps, cur_fps)
+        self.fps.set_active_id(cur_fps)
+        self.fps.set_tooltip_text("60 = animation la plus fluide, mais plus de batterie")
+        self.fps.connect("changed", self.on_fps_changed)
+        bar.pack_start(self.fps, False, False, 0)
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+        self.mute_btn = Gtk.ToggleButton()
+        self.mute_btn.set_active(self.cfg["muted"])
+        self.mute_btn.connect("toggled", self.on_mute)
+        bar.pack_start(self.mute_btn, False, False, 0)
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        self.volume.set_value(self.cfg["volume"])
+        self.volume.set_size_request(160, -1)
+        self.volume.set_value_pos(Gtk.PositionType.RIGHT)
+        self.volume.set_digits(0)
+        self.volume.connect("value-changed", self.on_volume)
+        bar.pack_start(self.volume, False, False, 0)
+        self.update_mute_icon()
+
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox.pack_start(scroll, True, True, 0)
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                homogeneous=True, max_children_per_line=6,
+                                column_spacing=8, row_spacing=8, margin=12)
+        scroll.add(self.flow)
+        self.status = Gtk.Label(xalign=0, margin=6, wrap=True)
+        vbox.pack_end(self.status, False, False, 0)
+
+        self.reload()
+
+    # ---------- construction ----------
+    def reload(self):
+        self.fill_screens()
+        self.populate()
+
+    def fill_screens(self):
+        current = self.screen_combo.get_active_id()
+        self.screens = fa.connected_screens()
+        self.screen_combo.remove_all()
+        if len(self.screens) > 1:
+            self.screen_combo.append(ALL, "Tous les écrans")
+        for i, s in enumerate(self.screens):
+            self.screen_combo.append(s, screen_label(s, i, len(self.screens)))
+        if current and current in self.screens + [ALL]:
+            self.screen_combo.set_active_id(current)
+        else:
+            self.screen_combo.set_active(0)
+
+    def populate(self):
+        for child in self.flow.get_children():
+            self.flow.remove(child)
+        self.buttons.clear()
+        items = list_wallpapers()
+        for it in items:
+            self.titles[it["id"]] = it["title"]
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            box.pack_start(thumbnail(it["preview"]), False, False, 0)
+            box.pack_start(Gtk.Label(label=it["title"], max_width_chars=28,
+                                     ellipsize=Pango.EllipsizeMode.END), False, False, 0)
+            kind = {"video": "Vidéo", "scene": "Scène"}.get(it["type"], it["type"])
+            info = Gtk.Label()
+            info.set_markup(f"<small>{kind}</small>")
+            box.pack_start(info, False, False, 0)
+            btn = Gtk.ToggleButton()
+            btn.add(box)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_tooltip_text(f"{it['title']}\nID {it['id']}")
+            btn.connect("toggled", self.on_pick, it)
+            btn.info_label = info
+            btn.kind = kind
+            self.flow.add(btn)
+            self.buttons[it["id"]] = btn
+        self.flow.show_all()
+        self.refresh_state()
+
+    # ---------- état ----------
+    def targets(self):
+        sel = self.screen_combo.get_active_id()
+        return self.screens if sel == ALL else ([sel] if sel else [])
+
+    def refresh_state(self):
+        if not self.buttons:
+            self.status.set_text("Aucun fond trouvé : abonnez-vous à des fonds dans le Workshop Steam de Wallpaper Engine, puis cliquez sur ⟳.")
+            return
+        on = self.cfg["enabled"]
+        targets = self.targets()
+        active = {self.cfg["screens"].get(s) for s in targets} if on else set()
+        for wid, btn in self.buttons.items():
+            btn.handler_block_by_func(self.on_pick)
+            btn.set_active(wid in active)
+            btn.handler_unblock_by_func(self.on_pick)
+            used_on = [s for s in self.screens if on and self.cfg["screens"].get(s) == wid]
+            extra = f" · sur {', '.join(used_on)}" if used_on and len(self.screens) > 1 else ""
+            btn.info_label.set_markup(f"<small>{btn.kind}{GLib.markup_escape_text(extra)}</small>")
+        self.stop_btn.set_sensitive(on)
+        if not on:
+            self.status.set_text("Fond animé arrêté (fond d'écran habituel). Cliquez sur un fond pour l'activer sur l'écran choisi.")
+            return
+        parts = []
+        for i, s in enumerate(self.screens):
+            wid = self.cfg["screens"].get(s)
+            parts.append(f"{screen_label(s, i, len(self.screens))} : {self.titles.get(wid, 'fond d'écran habituel')}")
+        son = "muet" if self.cfg["muted"] or self.cfg["volume"] == 0 else f"volume {self.cfg['volume']} %"
+        loading = "   ⏳ chargement du fond…" if getattr(self, "_loading", 0) or self._pending else ""
+        self.status.set_text("   •   ".join(parts) + f"\n{self.cfg['fps']} images/s, {son}{loading}")
+
+    def update_mute_icon(self):
+        muted = self.mute_btn.get_active()
+        icon = "audio-volume-muted-symbolic" if muted else "audio-volume-high-symbolic"
+        self.mute_btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+        self.mute_btn.set_tooltip_text("Son coupé (cliquer pour l'activer)" if muted else "Couper le son")
+        self.volume.set_sensitive(not muted)
+
+    # ---------- application ----------
+    def apply(self, delay_ms=0):
+        """Enregistre et relance ; avec délai pour regrouper les mouvements du curseur de volume."""
+        if self._pending:
+            GLib.source_remove(self._pending)
+            self._pending = None
+        if delay_ms:
+            self._pending = GLib.timeout_add(delay_ms, self._apply_now)
+        else:
+            self._apply_now()
+        self.refresh_state()
+
+    def _apply_now(self):
+        self._pending = None
+        fa.save(self.cfg)
+        proc = subprocess.Popen([LAUNCHER], start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._loading = getattr(self, "_loading", 0) + 1
+        self.set_loading()
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, self._on_loaded)
+        return False
+
+    def set_loading(self):
+        self.refresh_state()
+
+    def _on_loaded(self, pid, status):
+        self._loading -= 1
+        self.set_loading()
+
+    def on_pick(self, btn, it):
+        for s in self.targets():
+            self.cfg["screens"][s] = it["id"]
+        self.cfg["enabled"] = True
+        self.apply()
+
+    def on_fps_changed(self, *_):
+        self.cfg["fps"] = int(self.fps.get_active_id())
+        if self.cfg["enabled"]:
+            self.apply()
+        else:
+            fa.save(self.cfg)
+
+    def on_mute(self, *_):
+        self.cfg["muted"] = self.mute_btn.get_active()
+        self.update_mute_icon()
+        if self.cfg["enabled"]:
+            self.apply()
+        else:
+            fa.save(self.cfg)
+
+    def on_volume(self, *_):
+        self.cfg["volume"] = int(self.volume.get_value())
+        if self.cfg["enabled"]:
+            self.apply(delay_ms=600)
+        else:
+            fa.save(self.cfg)
+
+    def on_stop(self, *_):
+        subprocess.run([LAUNCHER, "stop"])
+        self.cfg = fa.load()
+        self.refresh_state()
+
+
+if __name__ == "__main__":
+    win = Selecteur()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()

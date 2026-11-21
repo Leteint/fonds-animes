@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Fonds animés — lanceur de linux-wallpaperengine, un fond par écran (X11).
+
+  fond-anime            : (re)lance selon ~/.config/fond-anime/config.json
+  fond-anime --auto     : idem, mais ne fait rien si le fond animé est arrêté (ouverture de session)
+  fond-anime stop       : arrête, et ne relance plus à l'ouverture de session
+  fond-anime ID [FPS]   : met le fond Workshop ID sur tous les écrans connectés
+
+Variable d'environnement facultative : FOND_ANIME_BIN = chemin de l'exécutable linux-wallpaperengine.
+"""
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "fond-anime"
+CONF = CONF_DIR / "config.json"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "fonds-animes"
+DEFAULT_BIN = DATA_DIR / "linux-wallpaperengine/build/output/linux-wallpaperengine"
+WE_APPID = "431960"  # Wallpaper Engine sur Steam
+DEFAULT = {"enabled": True, "fps": 30, "volume": 50, "muted": True, "screens": {}}
+
+STEAM_ROOTS = [
+    HOME / ".steam/steam",
+    HOME / ".local/share/Steam",
+    HOME / ".var/app/com.valvesoftware.Steam/.local/share/Steam",  # Steam en Flatpak
+]
+
+
+def steam_libraries():
+    """Dossiers steamapps de toutes les bibliothèques Steam (y compris sur d'autres disques)."""
+    libs = []
+    for root in STEAM_ROOTS:
+        sa = root / "steamapps"
+        if not sa.is_dir():
+            continue
+        candidates = [sa]
+        try:
+            vdf = (sa / "libraryfolders.vdf").read_text(errors="replace")
+            candidates += [Path(p) / "steamapps" for p in re.findall(r'"path"\s+"([^"]+)"', vdf)]
+        except OSError:
+            pass
+        for c in candidates:
+            try:
+                r = c.resolve()
+            except OSError:
+                continue
+            if r.is_dir() and r not in libs:
+                libs.append(r)
+    return libs
+
+
+def workshop_dirs():
+    return [d for d in (lib / "workshop/content" / WE_APPID for lib in steam_libraries()) if d.is_dir()]
+
+
+def assets_dir():
+    for lib in steam_libraries():
+        a = lib / "common/wallpaper_engine/assets"
+        if a.is_dir():
+            return a
+    return None
+
+
+def wallpaper_path(wid):
+    for d in workshop_dirs():
+        if (d / wid).is_dir():
+            return d / wid
+    return None
+
+
+def binary():
+    return Path(os.environ.get("FOND_ANIME_BIN", DEFAULT_BIN))
+
+
+def connected_screens():
+    """Écrans connectés et actifs, de gauche à droite."""
+    out = subprocess.run(["xrandr", "--query"], capture_output=True, text=True).stdout
+    screens = []
+    for m in re.finditer(r"^(\S+) connected (?:primary )?(\d+)x(\d+)\+(\d+)\+(\d+)", out, re.M):
+        screens.append((int(m.group(4)), int(m.group(5)), m.group(1)))
+    return [name for *_, name in sorted(screens)]
+
+
+def load():
+    cfg = dict(DEFAULT)
+    try:
+        cfg.update(json.loads(CONF.read_text()))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save(cfg):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONF.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    tmp.replace(CONF)
+
+
+def running_pids():
+    """PID des linux-wallpaperengine vivants (hors zombies)."""
+    out = subprocess.run(["pgrep", "-x", "linux-wallpaper"], capture_output=True, text=True).stdout
+    pids = []
+    for p in out.split():
+        try:
+            state = Path(f"/proc/{p}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            continue
+        if state != "Z":
+            pids.append(int(p))
+    return pids
+
+
+def root_pixmap():
+    out = subprocess.run(["xprop", "-root", "_XROOTPMAP_ID"], capture_output=True, text=True).stdout
+    return out.strip().rsplit(" ", 1)[-1] if "#" in out else ""
+
+
+def kill(pids, sig=signal.SIGKILL):
+    for p in pids:
+        try:
+            os.kill(p, sig)
+        except ProcessLookupError:
+            pass
+
+
+def wait_gone(pids, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end and any(p in running_pids() for p in pids):
+        time.sleep(0.05)
+
+
+def stop_wp():
+    old = running_pids()
+    kill(old, signal.SIGTERM)
+    wait_gone(old)
+    kill([p for p in old if p in running_pids()])
+
+
+def start(cfg):
+    """Bascule sans trou : l'ancien fond est figé et reste affiché jusqu'à ce que le nouveau ait
+    rendu ses premières images (voir patches/x11-bascule-sans-trou.patch), puis il est arrêté."""
+    old = running_pids()
+    if not cfg["enabled"]:
+        stop_wp()
+        return
+    exe = binary()
+    if not exe.is_file():
+        sys.exit(f"linux-wallpaperengine introuvable : {exe} (lancer install.sh ou définir FOND_ANIME_BIN)")
+    args = [str(exe), "--fps", str(cfg["fps"])]
+    assets = assets_dir()
+    if assets:
+        args += ["--assets-dir", str(assets)]
+    if cfg["muted"] or int(cfg["volume"]) == 0:
+        args.append("--silent")
+    else:
+        args += ["--volume", str(int(cfg["volume"]))]
+    n = 0
+    for screen in connected_screens():
+        wid = cfg["screens"].get(screen)
+        path = wallpaper_path(wid) if wid else None
+        if path:
+            args += ["--screen-root", screen, "--bg", str(path), "--scaling", "fill"]
+            n += 1
+    if n == 0:
+        stop_wp()
+        return
+    before = root_pixmap()
+    kill(old, signal.SIGSTOP)  # fige l'ancien : sa dernière image reste affichée
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(CONF_DIR / "log.txt", "w")
+    new = subprocess.Popen(args, cwd=exe.parent, stdout=log, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, start_new_session=True)
+    end = time.time() + 30
+    while time.time() < end and new.poll() is None:
+        if root_pixmap() not in ("", before):
+            break  # le nouveau fond a pris la main
+        time.sleep(0.05)
+    if new.poll() is not None:  # le nouveau a échoué : on remet l'ancien en route
+        kill(old, signal.SIGCONT)
+        return
+    kill(old)  # SIGKILL : un processus figé ne traiterait pas SIGTERM
+    wait_gone(old)
+
+
+def main():
+    # un seul lanceur à la fois : des clics rapprochés sont traités dans l'ordre, le dernier gagne
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(CONF_DIR / ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    cfg = load()
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg in ("-h", "--help"):
+        print(__doc__)
+        return
+    if arg == "stop":
+        cfg["enabled"] = False
+        save(cfg)
+        stop_wp()
+        return
+    if arg == "--auto":
+        if not cfg["enabled"]:
+            return
+        time.sleep(2)  # laisse le temps aux écrans d'être configurés à l'ouverture de session
+    elif arg:
+        cfg["screens"] = {s: arg for s in connected_screens()}
+        if len(sys.argv) > 2:
+            cfg["fps"] = int(sys.argv[2])
+        cfg["enabled"] = True
+    save(cfg)
+    start(cfg)
+
+
+if __name__ == "__main__":
+    main()
