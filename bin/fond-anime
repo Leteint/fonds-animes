@@ -5,6 +5,8 @@
   fond-anime --auto     : idem, mais ne fait rien si le fond animé est arrêté (ouverture de session)
   fond-anime stop       : arrête, et ne relance plus à l'ouverture de session
   fond-anime ID [FPS]   : met le fond Workshop ID sur tous les écrans connectés
+  fond-anime --watch    : surveillance (lancée automatiquement) : relance le fond si un écran est
+                          branché/débranché ou si linux-wallpaperengine plante
 
 Variable d'environnement facultative : FOND_ANIME_BIN = chemin de l'exécutable linux-wallpaperengine.
 """
@@ -190,16 +192,80 @@ def start(cfg):
     wait_gone(old)
 
 
-def main():
-    # un seul lanceur à la fois : des clics rapprochés sont traités dans l'ordre, le dernier gagne
+def launcher_lock():
+    """Un seul lanceur à la fois : des clics rapprochés sont traités dans l'ordre, le dernier gagne."""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(CONF_DIR / ".lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
-    cfg = load()
+    return lock
+
+
+def log_event(msg):
+    try:
+        with open(CONF_DIR / "surveillance.log", "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def watch():
+    """Surveillance : relance le fond quand un écran est branché/débranché ou si le programme plante
+    (linux-wallpaperengine plante quand la configuration des écrans change)."""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    wlock = open(CONF_DIR / ".watch.lock", "w")
+    try:
+        fcntl.flock(wlock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # une surveillance tourne déjà
+    last = connected_screens()
+    restarts = []
+    while True:
+        time.sleep(2)
+        cfg = load()
+        screens = connected_screens()
+        if not cfg["enabled"] or not any(cfg["screens"].get(s) for s in screens):
+            last = screens
+            continue
+        changed = screens != last
+        if not changed and running_pids():
+            continue
+        time.sleep(2)  # laisse la nouvelle configuration des écrans se stabiliser
+        restarts = [t for t in restarts if time.time() - t < 60]
+        if len(restarts) >= 3:  # évite une boucle de plantages : au plus 3 relances par minute
+            continue
+        reason = "écrans modifiés" if changed else "programme arrêté ou planté"
+        last = connected_screens()
+        log_event(f"relance ({reason}) : écrans {', '.join(last)}")
+        lock = launcher_lock()
+        try:
+            start(load())
+        finally:
+            lock.close()
+        restarts.append(time.time())
+
+
+def ensure_watcher():
+    """Démarre la surveillance en arrière-plan si elle ne tourne pas déjà."""
+    try:
+        with open(CONF_DIR / ".watch.lock", "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except BlockingIOError:
+        return
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--watch"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg in ("-h", "--help"):
         print(__doc__)
         return
+    if arg == "--watch":
+        watch()
+        return
+    lock = launcher_lock()
+    cfg = load()
     if arg == "stop":
         cfg["enabled"] = False
         save(cfg)
@@ -214,8 +280,12 @@ def main():
         if len(sys.argv) > 2:
             cfg["fps"] = int(sys.argv[2])
         cfg["enabled"] = True
+    else:
+        cfg["enabled"] = True  # « fond-anime » seul relance la dernière configuration, même après un stop
     save(cfg)
     start(cfg)
+    lock.close()
+    ensure_watcher()
 
 
 if __name__ == "__main__":
