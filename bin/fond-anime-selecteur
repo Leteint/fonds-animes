@@ -217,7 +217,8 @@ class Selecteur(Gtk.Window):
         parts = []
         for i, s in enumerate(self.screens):
             wid = self.cfg["screens"].get(s)
-            parts.append(f"{screen_label(s, i, len(self.screens))} : {self.titles.get(wid, 'fond d'écran habituel')}")
+            title = self.titles.get(wid, "fond d’écran habituel")
+            parts.append(f"{screen_label(s, i, len(self.screens))} : {title}")
         son = "muet" if self.cfg["muted"] or self.cfg["volume"] == 0 else f"volume {self.cfg['volume']} %"
         loading = "   ⏳ chargement du fond…" if getattr(self, "_loading", 0) or self._pending else ""
         self.status.set_text("   •   ".join(parts) + f"\n{self.cfg['fps']} images/s, {son}{loading}")
