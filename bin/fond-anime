@@ -82,8 +82,13 @@ def binary():
 
 
 def connected_screens():
-    """Écrans connectés et actifs, de gauche à droite."""
-    out = subprocess.run(["xrandr", "--query"], capture_output=True, text=True).stdout
+    """Écrans connectés et actifs, de gauche à droite.
+    --current lit la configuration connue du serveur X sans interroger le matériel : --query relit
+    l'EDID de chaque écran et bloque tout l'affichage pendant ce temps (jusqu'à 2 s par appel après
+    une sortie de veille, d'où un PC figé quand la surveillance l'appelait toutes les 2 s).
+    Les branchements restent détectés : le bureau interroge lui-même le matériel à chaque
+    branchement, ce qui met à jour la configuration connue."""
+    out = subprocess.run(["xrandr", "--current"], capture_output=True, text=True).stdout
     screens = []
     for m in re.finditer(r"^(\S+) connected (?:primary )?(\d+)x(\d+)\+(\d+)\+(\d+)", out, re.M):
         screens.append((int(m.group(4)), int(m.group(5)), m.group(1)))
@@ -208,9 +213,38 @@ def log_event(msg):
         pass
 
 
+BACKGROUND_KEYS = [  # fond fixe des réglages du bureau : Cinnamon, GNOME, MATE
+    ("org.cinnamon.desktop.background", "picture-uri", "picture-options"),
+    ("org.gnome.desktop.background", "picture-uri", "picture-options"),
+    ("org.mate.background", "picture-filename", "picture-options"),
+]
+
+
+def desktop_background():
+    for schema, *keys in BACKGROUND_KEYS:
+        vals = [subprocess.run(["gsettings", "get", schema, k], capture_output=True, text=True)
+                for k in keys]
+        if all(v.returncode == 0 for v in vals):
+            return " ".join(v.stdout.strip() for v in vals)
+    return None
+
+
+def disable(reason):
+    log_event(reason)
+    lock = launcher_lock()
+    try:
+        cfg = load()
+        cfg["enabled"] = False
+        save(cfg)
+        stop_wp()
+    finally:
+        lock.close()
+
+
 def watch():
     """Surveillance : relance le fond quand un écran est branché/débranché ou si le programme plante
-    (linux-wallpaperengine plante quand la configuration des écrans change)."""
+    (linux-wallpaperengine plante quand la configuration des écrans change), et arrête le fond
+    animé quand un fond fixe est choisi dans les réglages du bureau."""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     wlock = open(CONF_DIR / ".watch.lock", "w")
     try:
@@ -218,9 +252,16 @@ def watch():
     except BlockingIOError:
         return  # une surveillance tourne déjà
     last = connected_screens()
+    background = desktop_background()
     restarts = []
     while True:
         time.sleep(2)
+        bg = desktop_background()
+        if bg != background:
+            background = bg
+            if load()["enabled"]:
+                disable(f"fond fixe choisi dans les réglages du bureau ({bg}) : fond animé arrêté")
+            continue
         cfg = load()
         screens = connected_screens()
         if not cfg["enabled"] or not any(cfg["screens"].get(s) for s in screens):
