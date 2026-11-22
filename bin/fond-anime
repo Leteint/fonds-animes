@@ -149,6 +149,12 @@ def stop_wp():
     kill(old, signal.SIGTERM)
     wait_gone(old)
     kill([p for p in old if p in running_pids()])
+    if old:
+        # Le fond animé disparu laisse sur la fenêtre racine une référence vers une image qui n'existe
+        # plus : Cinnamon essaie alors en boucle de s'en servir (« Failed to create background
+        # texture from pixmap »). On l'efface pour qu'il revienne à son propre fond fixe.
+        for prop in ("_XROOTPMAP_ID", "ESETROOT_PMAP_ID"):
+            subprocess.run(["xprop", "-root", "-remove", prop], capture_output=True)
 
 
 def start(cfg):
